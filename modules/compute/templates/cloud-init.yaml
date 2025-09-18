@@ -1,0 +1,94 @@
+# #cloud-config
+
+# package_update: true
+# package_upgrade: true
+
+# packages:
+#   - openjdk-17-jdk
+#   - wget
+#   - unzip
+#   - azure-cli  # For Key Vault access
+
+# runcmd:
+#   - az login --identity
+#   - KEYCLOAK_ADMIN_PASSWORD=$(az keyvault secret show --vault-name ${key_vault_name} --name "keycloak-admin-password" --query value -o tsv)
+#   - POSTGRES_CONNECTION_STRING=$(az keyvault secret show --vault-name ${key_vault_name} --name "postgres-connection-string" --query value -o tsv)
+#   - POSTGRES_JDBC_URL=$(az keyvault secret show --vault-name ${key_vault_name} --name "postgres-jdbc-url" --query value -o tsv)
+#   - DB_URI="$POSTGRES_CONNECTION_STRING"
+#   - KC_DB_USERNAME=$(echo $DB_URI | sed -E 's/.*\/\/(.*):.*/\1/')
+#   - KC_DB_PASSWORD=$(echo $DB_URI | sed -E 's/.*:(.*)@.*/\1/')
+#   - cd /opt
+#   - wget https://github.com/keycloak/keycloak/releases/download/25.0.4/keycloak-25.0.4.zip
+#   - unzip keycloak-25.0.4.zip
+#   - mv keycloak-25.0.4 keycloak
+#   - chown -R root:root /opt/keycloak
+#   - cd /opt/keycloak
+#   - bin/kc.sh build
+#   - echo '[Unit]' > /etc/systemd/system/keycloak.service
+#   - echo 'Description=Keycloak' >> /etc/systemd/system/keycloak.service
+#   - echo 'After=network.target' >> /etc/systemd/system/keycloak.service
+#   - echo '' >> /etc/systemd/system/keycloak.service
+#   - echo '[Service]' >> /etc/systemd/system/keycloak.service
+#   - echo 'Environment="KEYCLOAK_ADMIN=admin"' >> /etc/systemd/system/keycloak.service
+#   - echo "Environment=\"KEYCLOAK_ADMIN_PASSWORD=$KEYCLOAK_ADMIN_PASSWORD\"" >> /etc/systemd/system/keycloak.service
+#   - echo 'Environment="KC_DB=postgres"' >> /etc/systemd/system/keycloak.service
+#   - echo "Environment=\"KC_DB_URL=$POSTGRES_JDBC_URL\"" >> /etc/systemd/system/keycloak.service
+#   - echo "Environment=\"KC_DB_USERNAME=$KC_DB_USERNAME\"" >> /etc/systemd/system/keycloak.service
+#   - echo "Environment=\"KC_DB_PASSWORD=$KC_DB_PASSWORD\"" >> /etc/systemd/system/keycloak.service
+#   - echo 'ExecStart=/opt/keycloak/bin/kc.sh start --optimized' >> /etc/systemd/system/keycloak.service
+#   - echo 'Restart=always' >> /etc/systemd/system/keycloak.service
+#   - echo '' >> /etc/systemd/system/keycloak.service
+#   - echo '[Install]' >> /etc/systemd/system/keycloak.service
+#   - echo 'WantedBy=multi-user.target' >> /etc/systemd/system/keycloak.service
+#   - systemctl daemon-reload
+#   - systemctl enable keycloak
+#   - systemctl start keycloak
+
+
+#cloud-config
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - openjdk-17-jdk
+  - wget
+  - unzip
+  - curl
+  - azure-cli
+  - python3
+  - python3-pip
+
+users:
+  - name: keycloak
+    system: true
+    home: /opt/keycloak
+    shell: /bin/bash
+
+runcmd:
+  # Enable managed identity login
+  - az login --identity
+  
+  # Create keycloak directory structure
+  - mkdir -p /opt/keycloak
+  - mkdir -p /var/log/keycloak
+  - chown -R keycloak:keycloak /opt/keycloak
+  - chown -R keycloak:keycloak /var/log/keycloak
+  
+  # Download Keycloak (basic installation only)
+  - cd /opt
+  - wget https://github.com/keycloak/keycloak/releases/download/25.0.4/keycloak-25.0.4.zip
+  - unzip keycloak-25.0.4.zip
+  - mv keycloak-25.0.4/* keycloak/
+  - rmdir keycloak-25.0.4
+  - rm keycloak-25.0.4.zip
+  - chown -R keycloak:keycloak /opt/keycloak
+  
+  # Mark VM as ready for Ansible
+  - touch /tmp/cloud-init-complete
+  
+write_files:
+  - path: /etc/environment
+    content: |
+      KEY_VAULT_NAME=${key_vault_name}
+    append: true

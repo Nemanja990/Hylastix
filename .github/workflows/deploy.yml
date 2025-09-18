@@ -1,0 +1,357 @@
+name: Deploy Keycloak Infrastructure
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - '**.tf'
+      - 'ansible/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.tf'
+      - 'ansible/**'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  TF_VERSION: '1.6.0'
+  ANSIBLE_VERSION: '8.0.0'
+  AZURE_REGION: 'East US'
+
+jobs:
+  terraform-plan:
+    name: 'Terraform Plan'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Terraform Format Check
+      run: terraform fmt -check -recursive
+      continue-on-error: true
+
+    - name: Terraform Init
+      run: |
+        terraform init \
+          -backend-config="resource_group_name=${{ secrets.TF_STATE_RESOURCE_GROUP }}" \
+          -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+          -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+          -backend-config="key=${{ github.event.inputs.environment || 'dev' }}/terraform.tfstate"
+
+    - name: Terraform Validate
+      run: terraform validate
+
+    - name: Terraform Plan
+      run: |
+        terraform plan \
+          -var-file="environments/${{ github.event.inputs.environment || 'dev' }}.tfvars" \
+          -out=tfplan \
+          -detailed-exitcode
+      continue-on-error: true
+
+    - name: Upload Terraform Plan
+      uses: actions/upload-artifact@v3
+      with:
+        name: tfplan-${{ github.event.inputs.environment || 'dev' }}
+        path: tfplan
+
+    - name: Comment PR with Plan
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+          #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+          #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+          #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+          
+          <details><summary>Show Plan</summary>
+          
+          \`\`\`terraform
+          ${{ steps.plan.outputs.stdout }}
+          \`\`\`
+          
+          </details>
+          
+          *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+          })
+
+  terraform-apply:
+    name: 'Terraform Apply'
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.event.inputs.action == 'apply')
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        terraform_wrapper: false
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Download Terraform Plan
+      uses: actions/download-artifact@v3
+      with:
+        name: tfplan-${{ github.event.inputs.environment || 'dev' }}
+
+    - name: Terraform Init
+      run: |
+        terraform init \
+          -backend-config="resource_group_name=${{ secrets.TF_STATE_RESOURCE_GROUP }}" \
+          -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+          -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+          -backend-config="key=${{ github.event.inputs.environment || 'dev' }}/terraform.tfstate"
+
+    - name: Terraform Apply
+      run: terraform apply -auto-approve tfplan
+
+    - name: Get Terraform Outputs
+      id: tf_outputs
+      run: |
+        echo "vmss_name=$(terraform output -raw vmss_name)" >> $GITHUB_OUTPUT
+        echo "resource_group=$(terraform output -raw resource_group_name)" >> $GITHUB_OUTPUT
+        echo "lb_public_ip=$(terraform output -raw load_balancer_public_ip)" >> $GITHUB_OUTPUT
+        echo "db_host=$(terraform output -raw database_host)" >> $GITHUB_OUTPUT
+
+    - name: Store Infrastructure Outputs
+      uses: actions/upload-artifact@v3
+      with:
+        name: terraform-outputs-${{ github.event.inputs.environment || 'dev' }}
+        path: terraform-outputs.json
+
+  ansible-deploy:
+    name: 'Deploy Keycloak with Ansible'
+    runs-on: ubuntu-latest
+    needs: terraform-apply
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.event.inputs.action == 'apply')
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install Ansible and Azure CLI
+      run: |
+        pip install ansible==${{ env.ANSIBLE_VERSION }}
+        pip install azure-cli
+        pip install azure-mgmt-compute
+        ansible-galaxy collection install azure.azcollection
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Download Terraform Outputs
+      uses: actions/download-artifact@v3
+      with:
+        name: terraform-outputs-${{ github.event.inputs.environment || 'dev' }}
+
+    - name: Generate Dynamic Inventory
+      run: |
+        az vmss list-instances \
+          --resource-group ${{ needs.terraform-apply.outputs.resource_group }} \
+          --name ${{ needs.terraform-apply.outputs.vmss_name }} \
+          --query '[].{name:name, privateIpAddress:networkProfile.networkInterfaces[0].ipConfigurations[0].privateIpAddress}' \
+          --output json > vmss_instances.json
+        
+        python3 << EOF
+        import json
+        
+        with open('vmss_instances.json', 'r') as f:
+            instances = json.load(f)
+        
+        inventory = {
+            'keycloak_servers': {
+                'hosts': {},
+                'vars': {
+                    'ansible_user': 'azureuser',
+                    'ansible_ssh_private_key_file': '/tmp/ssh_key',
+                    'ansible_ssh_common_args': '-o StrictHostKeyChecking=no',
+                    'db_host': '${{ needs.terraform-apply.outputs.db_host }}',
+                    'db_username': '${{ secrets.DB_USERNAME }}',
+                    'db_password': '${{ secrets.DB_PASSWORD }}',
+                    'keycloak_admin_user': '${{ secrets.KEYCLOAK_ADMIN_USER }}',
+                    'keycloak_admin_password': '${{ secrets.KEYCLOAK_ADMIN_PASSWORD }}',
+                    'lb_hostname': '${{ needs.terraform-apply.outputs.lb_public_ip }}'
+                }
+            }
+        }
+        
+        for instance in instances:
+            inventory['keycloak_servers']['hosts'][instance['name']] = {
+                'ansible_host': instance['privateIpAddress']
+            }
+        
+        with open('ansible/inventory/dynamic_inventory.json', 'w') as f:
+            json.dump(inventory, f, indent=2)
+        EOF
+
+    - name: Setup SSH Key
+      run: |
+        echo '${{ secrets.SSH_PRIVATE_KEY }}' > /tmp/ssh_key
+        chmod 600 /tmp/ssh_key
+
+    - name: Create Ansible Templates
+      run: |
+        mkdir -p ansible/templates
+        
+        cat > ansible/templates/keycloak.conf.j2 << EOF
+        # Database
+        db=postgres
+        db-url=jdbc:postgresql://{{ db_host }}:5432/{{ db_name }}
+        db-username={{ db_username }}
+        db-password={{ db_password }}
+        
+        # HTTP/HTTPS
+        hostname={{ lb_hostname }}
+        http-port={{ keycloak_port }}
+        https-port=8443
+        
+        # Clustering
+        cache=ispn
+        cache-stack=kubernetes
+        
+        # Health and metrics
+        health-enabled=true
+        metrics-enabled=true
+        
+        # Logging
+        log-level=INFO
+        log-console-output=json
+        EOF
+
+        cat > ansible/templates/keycloak.service.j2 << EOF
+        [Unit]
+        Description=Keycloak Server
+        After=network.target
+        
+        [Service]
+        Type=notify
+        User={{ keycloak_user }}
+        Group={{ keycloak_group }}
+        Environment=KEYCLOAK_ADMIN={{ keycloak_admin_user }}
+        Environment=KEYCLOAK_ADMIN_PASSWORD={{ keycloak_admin_password }}
+        ExecStart={{ keycloak_home }}/bin/kc.sh start --optimized
+        Restart=always
+        RestartSec=5
+        StandardOutput=journal
+        StandardError=journal
+        
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+
+    - name: Run Ansible Playbook
+      run: |
+        cd ansible
+        ansible-playbook \
+          -i inventory/dynamic_inventory.json \
+          playbooks/deploy-keycloak.yml \
+          -v
+
+    - name: Test Keycloak Deployment
+      run: |
+        sleep 60
+        curl -f http://${{ needs.terraform-apply.outputs.lb_public_ip }}:8080/health/ready || exit 1
+        echo "Keycloak deployment successful!"
+
+  terraform-destroy:
+    name: 'Terraform Destroy'
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'destroy'
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Terraform Init
+      run: |
+        terraform init \
+          -backend-config="resource_group_name=${{ secrets.TF_STATE_RESOURCE_GROUP }}" \
+          -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+          -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+          -backend-config="key=${{ github.event.inputs.environment || 'dev' }}/terraform.tfstate"
+
+    - name: Terraform Destroy
+      run: |
+        terraform destroy \
+          -var-file="environments/${{ github.event.inputs.environment || 'dev' }}.tfvars" \
+          -auto-approve
